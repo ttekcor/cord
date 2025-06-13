@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Голосовой чат</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 20px;
+      }
+      .controls {
+        margin: 20px 0;
+      }
+      button {
+        padding: 10px 20px;
+        margin: 5px;
+        cursor: pointer;
+      }
+      .status {
+        margin: 10px 0;
+        padding: 10px;
+        border-radius: 4px;
+      }
+      .connected {
+        background-color: #d4edda;
+        color: #155724;
+      }
+      .disconnected {
+        background-color: #f8d7da;
+        color: #721c24;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Голосовой чат</h1>
+    <div id="status" class="status disconnected">Отключено</div>
+    <div class="controls">
+      <button id="startButton">Начать</button>
+      <button id="stopButton" disabled>Остановить</button>
+      <button id="testSound">Тестовый звук</button>
+    </div>
+    <canvas
+      id="eq"
+      width="400"
+      height="60"
+      style="background: #222; display: block; margin: 20px 0"
+    ></canvas>
+
+    <script>
+      const startButton = document.getElementById("startButton");
+      const stopButton = document.getElementById("stopButton");
+      const statusDiv = document.getElementById("status");
+      let ws;
+      let peerConnection;
+      let localStream;
+      let remoteAudio;
+      let role = null;
+      let analyser;
+      let animationId;
+
+      const configuration = {
+        iceServers: [
+          {
+            urls: "stun:stun.l.google.com:19302",
+          },
+        ],
+      };
+
+      async function start() {
+        try {
+          localStream = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+          });
+          visualize(localStream);
+          peerConnection = new RTCPeerConnection(configuration);
+
+          // Добавляем локальный аудио поток
+          localStream.getTracks().forEach((track) => {
+            peerConnection.addTrack(track, localStream);
+          });
+
+          // Обработка ICE кандидатов
+          peerConnection.onicecandidate = (event) => {
+            if (event.candidate) {
+              sendMessage({
+                type: "candidate",
+                candidate: event.candidate.candidate,
+                sdpMid: event.candidate.sdpMid,
+                sdpMLineIndex: event.candidate.sdpMLineIndex,
+              });
+            }
+          };
+
+          // Создаем и отправляем offer
+          const offer = await peerConnection.createOffer();
+          await peerConnection.setLocalDescription(offer);
+          sendMessage({
+            type: "offer",
+            sdp: offer.sdp,
+          });
+
+          peerConnection.ontrack = (event) => {
+            console.log("Получен удалённый поток", event.streams[0]);
+            if (!remoteAudio) {
+              remoteAudio = new Audio();
+              remoteAudio.autoplay = true;
+              remoteAudio.srcObject = event.streams[0];
+              visualize(event.streams[0]);
+            }
+          };
+
+          startButton.disabled = true;
+          stopButton.disabled = false;
+          statusDiv.textContent = "Подключение...";
+          statusDiv.className = "status connected";
+        } catch (err) {
+          console.error("Ошибка при старте:", err);
+          statusDiv.textContent = "Ошибка: " + err.message;
+          statusDiv.className = "status disconnected";
+        }
+      }
+
+      function stop() {
+        if (localStream) {
+          localStream.getTracks().forEach((track) => track.stop());
+        }
+        if (peerConnection) {
+          peerConnection.close();
+        }
+        if (remoteAudio) {
+          remoteAudio.srcObject = null;
+          remoteAudio = null;
+        }
+        stopVisualize();
+        startButton.disabled = false;
+        stopButton.disabled = true;
+        statusDiv.textContent = "Отключено";
+        statusDiv.className = "status disconnected";
+      }
+
+      function connect() {
+        ws = new WebSocket("ws://" + window.location.host + "/signal");
+        ws.onmessage = async (event) => {
+          const message = JSON.parse(event.data);
+
+          if (message.type === "role") {
+            role = message.role;
+            if (role === "initiator") {
+              startAsInitiator();
+            }
+            // receiver начнёт после получения offer
+          } else if (message.type === "offer" && role === "receiver") {
+            await startAsReceiver(message.sdp);
+          } else if (message.type === "answer" && role === "initiator") {
+            await peerConnection.setRemoteDescription(
+              new RTCSessionDescription({
+                type: "answer",
+                sdp: message.sdp,
+              })
+            );
+          } else if (message.type === "candidate") {
+            await peerConnection.addIceCandidate(
+              new RTCIceCandidate({
+                candidate: message.candidate,
+                sdpMid: message.sdpMid,
+                sdpMLineIndex: message.sdpMLineIndex,
+              })
+            );
+          }
+        };
+      }
+
+      async function startAsInitiator() {
+        localStream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+        });
+        peerConnection = createPeerConnection();
+        localStream.getTracks().forEach((track) => {
+          peerConnection.addTrack(track, localStream);
+        });
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
+        ws.send(JSON.stringify({ type: "offer", sdp: offer.sdp }));
+      }
+
+      async function startAsReceiver(offerSdp) {
+        localStream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+        });
+        peerConnection = createPeerConnection();
+        localStream.getTracks().forEach((track) => {
+          peerConnection.addTrack(track, localStream);
+        });
+        await peerConnection.setRemoteDescription(
+          new RTCSessionDescription({
+            type: "offer",
+            sdp: offerSdp,
+          })
+        );
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+        ws.send(JSON.stringify({ type: "answer", sdp: answer.sdp }));
+      }
+
+      function createPeerConnection() {
+        const pc = new RTCPeerConnection({
+          iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        });
+        pc.onicecandidate = (event) => {
+          if (event.candidate) {
+            ws.send(
+              JSON.stringify({
+                type: "candidate",
+                candidate: event.candidate.candidate,
+                sdpMid: event.candidate.sdpMid,
+                sdpMLineIndex: event.candidate.sdpMLineIndex,
+              })
+            );
+          }
+        };
+        pc.ontrack = (event) => {
+          console.log("Получен удалённый поток", event.streams[0]);
+          if (!remoteAudio) {
+            remoteAudio = new Audio();
+            remoteAudio.autoplay = true;
+            remoteAudio.srcObject = event.streams[0];
+            visualize(event.streams[0]);
+          }
+        };
+        return pc;
+      }
+
+      function sendMessage(message) {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(message));
+        }
+      }
+
+      function visualize(stream) {
+        const audioCtx = new (window.AudioContext ||
+          window.webkitAudioContext)();
+        const source = audioCtx.createMediaStreamSource(stream);
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 64;
+        source.connect(analyser);
+        const canvas = document.getElementById("eq");
+        const ctx = canvas.getContext("2d");
+        const bufferLength = analyser.frequencyBinCount;
+        const dataArray = new Uint8Array(bufferLength);
+
+        function draw() {
+          animationId = requestAnimationFrame(draw);
+          analyser.getByteFrequencyData(dataArray);
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          const barWidth = canvas.width / bufferLength;
+          for (let i = 0; i < bufferLength; i++) {
+            const barHeight = dataArray[i] / 2;
+            ctx.fillStyle = "#4caf50";
+            ctx.fillRect(
+              i * barWidth,
+              canvas.height - barHeight,
+              barWidth - 2,
+              barHeight
+            );
+          }
+        }
+        draw();
+      }
+
+      function stopVisualize() {
+        if (animationId) cancelAnimationFrame(animationId);
+        const canvas = document.getElementById("eq");
+        const ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }
+
+      startButton.onclick = () => {
+        connect();
+        startButton.disabled = true;
+        stopButton.disabled = false;
+        statusDiv.textContent = "Подключение...";
+        statusDiv.className = "status connected";
+      };
+      stopButton.onclick = stop;
+
+      document.getElementById("testSound").onclick = () => {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const o = ctx.createOscillator();
+        o.type = "sine";
+        o.frequency.value = 440;
+        o.connect(ctx.destination);
+        o.start();
+        o.stop(ctx.currentTime + 0.2);
+      };
+    </script>
+  </body>
+</html>
